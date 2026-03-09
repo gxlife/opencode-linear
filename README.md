@@ -1,5 +1,6 @@
 # OpenCode Linear Plugin
 
+[![npm version](https://img.shields.io/npm/v/opencode-linear.svg)](https://www.npmjs.com/package/opencode-linear)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Linear issue workflow plugin for [OpenCode](https://opencode.ai/). Automatically sync your development tasks with Linear, track progress, and manage issue lifecycle without leaving your editor.
@@ -17,27 +18,26 @@ Linear issue workflow plugin for [OpenCode](https://opencode.ai/). Automatically
 ### Prerequisites
 
 - [OpenCode](https://opencode.ai/) installed
-- [Linear CLI](https://github.com/linear/linear) installed and authenticated
+- [Linear CLI](https://github.com/schpet/linear-cli) installed globally:
+  ```bash
+  npm install -g @schpet/linear-cli
+  linear auth login  # Authenticate with Linear
+  ```
 
 ### Install Plugin
 
-Add to your `~/.config/opencode/opencode.json`:
+```bash
+npm install -g opencode-linear
+```
+
+Then add to your `~/.config/opencode/opencode.json`:
 
 ```json
 {
   "plugin": [
-    "file:///Users/yourname/.config/opencode/plugin/opencode-linear/dist/index.js"
+    "opencode-linear"
   ]
 }
-```
-
-Or clone and build:
-
-```bash
-git clone https://github.com/yourusername/opencode-linear.git
-cd opencode-linear
-npm install
-npm run build
 ```
 
 ## 🚀 Usage
@@ -97,6 +97,10 @@ The plugin provides these tools for agent use:
 ## 🏗️ Development
 
 ```bash
+# Clone the repository
+git clone https://github.com/gxlife/opencode-linear.git
+cd opencode-linear
+
 # Install dependencies
 npm install
 
@@ -112,7 +116,7 @@ npm run fmt
 
 ## 📄 License
 
-MIT © [Your Name](https://github.com/yourusername)
+MIT © [gxlife](https://github.com/gxlife)
 
 ## 🤝 Contributing
 

@@ -24,18 +24,19 @@
     "workflow",
     "productivity"
   ],
-  "author": "Your Name",
+  "author": "gxlife",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/opencode-linear.git"
+    "url": "git+https://github.com/gxlife/opencode-linear.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/opencode-linear/issues"
+    "url": "https://github.com/gxlife/opencode-linear/issues"
   },
-  "homepage": "https://github.com/yourusername/opencode-linear#readme",
+  "homepage": "https://github.com/gxlife/opencode-linear#readme",
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.0.0"
+    "@opencode-ai/plugin": "^1.0.0",
+    "@schpet/linear-cli": "^1.11.0"
   },
   "devDependencies": {
     "@types/bun": "^1.0.0",
