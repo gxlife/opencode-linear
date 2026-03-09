@@ -1,0 +1,636 @@
+import type { Database } from "bun:sqlite"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import * as os from "node:os"
+import * as path from "node:path"
+import { type Plugin, tool } from "@opencode-ai/plugin"
+
+import { getSessionIssue, initLinearWorkflowDb, upsertSessionIssue } from "./state"
+
+interface Logger {
+  debug: (msg: string) => void
+  info: (msg: string) => void
+  warn: (msg: string) => void
+  error: (msg: string) => void
+}
+
+interface IssueDetails {
+  issueId: string
+  title: string
+  description: string
+  stateName: string
+}
+
+interface LinearWorkflowConfig {
+  project?: string
+  team?: string
+  labels?: string[]
+  defaultState?: string
+}
+
+let db: Database | null = null
+let cachedConfig: LinearWorkflowConfig | null = null
+
+function normalizeText(input: unknown): string {
+  return typeof input === "string" ? input : ""
+}
+
+function isIssueIdentifier(input: string): boolean {
+  return /^[A-Z][A-Z0-9]+-\d+$/.test(input.trim())
+}
+
+function extractTitleFromInput(input: string): string {
+  const firstLine = input
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0)
+  if (!firstLine) return "Untitled task"
+  return firstLine.slice(0, 120)
+}
+
+function issueIdFromText(output: string): string | null {
+  const match = output.match(/\b([A-Z][A-Z0-9]+-\d+)\b/)
+  return match?.[1] ?? null
+}
+
+function compactText(text: string, max = 1200): string {
+  const normalized = text.trim().replace(/\n{3,}/g, "\n\n")
+  return normalized.length > max ? `${normalized.slice(0, max)}\n\n...` : normalized
+}
+
+async function runLinear(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  try {
+    const proc = Bun.spawn(["linear", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+
+    const [stdout, stderr, exited] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ])
+
+    return {
+      ok: exited === 0,
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
+
+function extractIssueFromJson(raw: string, fallbackIssueId: string): IssueDetails | null {
+  try {
+    const parsed = JSON.parse(raw)
+    const issue = parsed?.data?.issue ?? parsed?.issue ?? parsed
+
+    const title =
+      normalizeText(issue?.title) ||
+      normalizeText(issue?.name) ||
+      fallbackIssueId
+
+    const description =
+      normalizeText(issue?.description) ||
+      normalizeText(issue?.body) ||
+      normalizeText(issue?.data?.description) ||
+      ""
+
+    const stateName =
+      normalizeText(issue?.state?.name) ||
+      normalizeText(issue?.state) ||
+      ""
+
+    return {
+      issueId: fallbackIssueId,
+      title,
+      description,
+      stateName,
+    }
+  } catch {
+    return null
+  }
+}
+
+async function updateIssueStateWithFallbacks(
+  issueId: string,
+  candidates: string[],
+  cwd: string,
+): Promise<{ ok: boolean; stateUsed?: string; error?: string }> {
+  let lastError = ""
+
+  for (const state of candidates) {
+    const updated = await runLinear(["issue", "update", issueId, "--state", state], cwd)
+    if (updated.ok) {
+      return { ok: true, stateUsed: state }
+    }
+    lastError = updated.stderr || updated.stdout || lastError
+  }
+
+  return { ok: false, error: lastError || "Failed to update issue state" }
+}
+
+async function addCommentViaTempFile(issueId: string, content: string, cwd: string): Promise<{ ok: boolean; error?: string }> {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "linear-workflow-"))
+  const filePath = path.join(tempDir, "comment.md")
+
+  try {
+    await writeFile(filePath, content, "utf8")
+    const result = await runLinear(["issue", "comment", "add", issueId, "--body-file", filePath], cwd)
+    if (!result.ok) {
+      return { ok: false, error: result.stderr || result.stdout }
+    }
+    return { ok: true }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true })
+  }
+}
+
+function extractUserText(parts: any[]): string {
+  const texts: string[] = []
+  for (const part of parts ?? []) {
+    if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+      texts.push(part.text)
+    }
+  }
+  return texts.join("\n").trim()
+}
+
+function nowIso(): string {
+  return new Date().toISOString()
+}
+
+async function ensureDb(directory: string): Promise<Database> {
+  if (!db) {
+    db = await initLinearWorkflowDb(directory)
+  }
+  return db
+}
+
+function buildStartResponse(issue: IssueDetails, startedState: string | null, taskPrompt: string): string {
+  const stateLine = startedState ? `State updated to: ${startedState}` : "State unchanged"
+  return [
+    `Linked issue: ${issue.issueId}`,
+    `Title: ${issue.title}`,
+    stateLine,
+    "",
+    "TASK_PROMPT:",
+    taskPrompt.trim(),
+  ].join("\n")
+}
+
+function shouldAutoPromote(stateName: string): boolean {
+  const normalized = stateName.trim().toLowerCase()
+  return ["backlog", "todo", "to do", "unstarted", "triage"].includes(normalized)
+}
+
+const stateCandidates: Record<string, string[]> = {
+  in_progress: ["started", "in progress", "inprogress"],
+  in_review: ["in review", "review", "ready review", "ready for review"],
+  completed: ["completed", "done"],
+  canceled: ["canceled", "cancelled"],
+}
+
+function getConfigPaths(directory: string): string[] {
+  return [
+    path.join(directory, ".opencode", "linear-workflow.json"),
+    path.join(directory, ".opencode", "linear-workflow.jsonc"),
+    path.join(os.homedir(), ".config", "opencode", "linear-workflow.json"),
+    path.join(os.homedir(), ".config", "opencode", "linear-workflow.jsonc"),
+  ]
+}
+
+async function loadConfig(directory: string): Promise<LinearWorkflowConfig> {
+  if (cachedConfig) return cachedConfig
+
+  const configPaths = getConfigPaths(directory)
+
+  for (const configPath of configPaths) {
+    try {
+      const file = Bun.file(configPath)
+      if (!(await file.exists())) continue
+
+      const content = await file.text()
+      const cleaned = content
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/.*$/gm, "")
+        .replace(/,\s*([}\]])/g, "$1")
+
+      cachedConfig = JSON.parse(cleaned) as LinearWorkflowConfig
+      return cachedConfig
+    } catch {
+      continue
+    }
+  }
+
+  cachedConfig = {}
+  return cachedConfig
+}
+
+function buildCreateArgs(title: string, descriptionFile: string, config: LinearWorkflowConfig): string[] {
+  const args = [
+    "issue", "create",
+    "--title", title,
+    "--description-file", descriptionFile,
+    "--state", config.defaultState || "backlog",
+    "--no-interactive",
+  ]
+
+  if (config.project) {
+    args.push("--project", config.project)
+  }
+
+  if (config.team) {
+    args.push("--team", config.team)
+  }
+
+  if (config.labels && config.labels.length > 0) {
+    for (const label of config.labels) {
+      args.push("--label", label)
+    }
+  }
+
+  return args
+}
+
+function buildListArgs(config: LinearWorkflowConfig): string[] {
+  const args = ["issue", "list", "--all-states"]
+
+  if (config.project) {
+    args.push("--project", config.project)
+  }
+
+  if (config.team) {
+    args.push("--team", config.team)
+  }
+
+  return args
+}
+
+export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
+  const log: Logger = {
+    debug: (msg) => client.app.log({ body: { service: "linear-workflow", level: "debug", message: msg } }).catch(() => {}),
+    info: (msg) => client.app.log({ body: { service: "linear-workflow", level: "info", message: msg } }).catch(() => {}),
+    warn: (msg) => client.app.log({ body: { service: "linear-workflow", level: "warn", message: msg } }).catch(() => {}),
+    error: (msg) => client.app.log({ body: { service: "linear-workflow", level: "error", message: msg } }).catch(() => {}),
+  }
+
+  const database = await ensureDb(directory)
+  const config = await loadConfig(directory)
+
+  const syncUserMessageIfBound = async (sessionID: string, userText: string): Promise<void> => {
+    if (!userText) return
+    const sessionIssue = getSessionIssue(database, sessionID)
+    if (!sessionIssue) return
+
+    const body = [
+      "### User Input",
+      "",
+      `Session: ${sessionID}`,
+      `Time: ${nowIso()}`,
+      "",
+      compactText(userText, 4000),
+    ].join("\n")
+
+    const added = await addCommentViaTempFile(sessionIssue.issueId, body, directory)
+    if (!added.ok) {
+      log.warn(`Failed to sync user message comment: ${added.error ?? "unknown"}`)
+    }
+  }
+
+  return {
+    tool: {
+      linear_workflow_start: tool({
+        description:
+          "Start workflow from Linear issue or create one from input, then bind current session to that issue. Respects project/team/labels config.",
+        args: {
+          input: tool.schema.string().describe("Issue identifier or natural language requirement text"),
+        },
+        async execute(args, toolCtx) {
+          const rawInput = args.input.trim()
+          if (!rawInput) {
+            return "Input is empty. Provide an issue id like ENG-123 or requirement text."
+          }
+
+          let issue: IssueDetails | null = null
+          let taskPrompt = rawInput
+
+          if (isIssueIdentifier(rawInput)) {
+            const viewed = await runLinear(["issue", "view", rawInput, "--json", "--no-comments"], directory)
+            if (viewed.ok) {
+              issue = extractIssueFromJson(viewed.stdout, rawInput)
+              if (issue) {
+                taskPrompt = issue.description || issue.title
+              }
+            }
+          }
+
+          if (!issue) {
+            const title = extractTitleFromInput(rawInput)
+            const tempDir = await mkdtemp(path.join(os.tmpdir(), "linear-workflow-"))
+            const descriptionFile = path.join(tempDir, "description.md")
+
+            try {
+              await writeFile(descriptionFile, rawInput, "utf8")
+              const createArgs = buildCreateArgs(title, descriptionFile, config)
+              const created = await runLinear(createArgs, directory)
+
+              if (!created.ok) {
+                return `Failed to create issue: ${created.stderr || created.stdout}`
+              }
+
+              const createdIssueId = issueIdFromText(created.stdout)
+              if (!createdIssueId) {
+                return `Issue may have been created, but identifier could not be parsed. Output: ${created.stdout}`
+              }
+
+              const viewed = await runLinear(["issue", "view", createdIssueId, "--json", "--no-comments"], directory)
+              if (!viewed.ok) {
+                return `Issue created (${createdIssueId}), but failed to view details: ${viewed.stderr || viewed.stdout}`
+              }
+
+              issue = extractIssueFromJson(viewed.stdout, createdIssueId)
+              if (!issue) {
+                return `Issue created (${createdIssueId}), but failed to parse details.`
+              }
+
+              taskPrompt = rawInput
+            } finally {
+              await rm(tempDir, { recursive: true, force: true })
+            }
+          }
+
+          if (!issue) {
+            return "Failed to start workflow: issue resolution failed."
+          }
+
+          let startedState: string | null = null
+          if (shouldAutoPromote(issue.stateName)) {
+            const promoted = await updateIssueStateWithFallbacks(issue.issueId, stateCandidates.in_progress, directory)
+            if (promoted.ok) {
+              startedState = promoted.stateUsed ?? "started"
+              issue.stateName = startedState
+            }
+          }
+
+          upsertSessionIssue(database, {
+            sessionId: toolCtx.sessionID,
+            issueId: issue.issueId,
+            issueTitle: issue.title,
+            issueState: issue.stateName || "",
+            updatedAt: nowIso(),
+          })
+
+          return buildStartResponse(issue, startedState, taskPrompt)
+        },
+      }),
+
+      linear_workflow_update: tool({
+        description: "Update current bound issue state to in_progress, in_review, completed, or canceled.",
+        args: {
+          state: tool.schema
+            .enum(["in_progress", "in_review", "completed", "canceled"])
+            .describe("Target workflow state"),
+        },
+        async execute(args, toolCtx) {
+          const sessionIssue = getSessionIssue(database, toolCtx.sessionID)
+          if (!sessionIssue) {
+            return "No bound issue for this session. Run /issue-start first."
+          }
+
+          const candidates = stateCandidates[args.state]
+          if (!candidates) {
+            return `Unsupported state: ${args.state}`
+          }
+
+          const updated = await updateIssueStateWithFallbacks(sessionIssue.issueId, candidates, directory)
+          if (!updated.ok) {
+            return `Failed to update state: ${updated.error ?? "unknown"}`
+          }
+
+          upsertSessionIssue(database, {
+            ...sessionIssue,
+            issueState: updated.stateUsed ?? args.state,
+            updatedAt: nowIso(),
+          })
+
+          return `Updated ${sessionIssue.issueId} to state: ${updated.stateUsed ?? args.state}`
+        },
+      }),
+
+      linear_sync_comment: tool({
+        description: "Add a markdown comment to the current bound Linear issue.",
+        args: {
+          content: tool.schema.string().describe("Comment markdown content"),
+          kind: tool.schema
+            .enum(["progress", "user_message", "note"])
+            .optional()
+            .describe("Comment category for traceability"),
+        },
+        async execute(args, toolCtx) {
+          const sessionIssue = getSessionIssue(database, toolCtx.sessionID)
+          if (!sessionIssue) {
+            return "No bound issue for this session. Run /issue-start first."
+          }
+
+          const header =
+            args.kind === "user_message"
+              ? "### User Message"
+              : args.kind === "progress"
+                ? "### Progress Update"
+                : "### Note"
+
+          const body = [
+            header,
+            "",
+            `Session: ${toolCtx.sessionID}`,
+            `Time: ${nowIso()}`,
+            "",
+            compactText(args.content, 6000),
+          ].join("\n")
+
+          const added = await addCommentViaTempFile(sessionIssue.issueId, body, directory)
+          if (!added.ok) {
+            return `Failed to add comment: ${added.error ?? "unknown"}`
+          }
+
+          return `Comment synced to ${sessionIssue.issueId}`
+        },
+      }),
+
+      linear_get_current_issue: tool({
+        description: "Get currently bound Linear issue for this session.",
+        args: {},
+        async execute(_args, toolCtx) {
+          const sessionIssue = getSessionIssue(database, toolCtx.sessionID)
+          if (!sessionIssue) {
+            return "No issue is currently bound to this session."
+          }
+
+          return JSON.stringify(sessionIssue, null, 2)
+        },
+      }),
+
+      linear_workflow_list: tool({
+        description: "List Linear issues respecting project/team config filters.",
+        args: {
+          state: tool.schema.string().optional().describe("Filter by state (backlog, unstarted, started, completed, canceled)"),
+          limit: tool.schema.number().optional().describe("Maximum issues to return"),
+        },
+        async execute(args) {
+          const listArgs = buildListArgs(config)
+
+          if (args.state) {
+            listArgs.push("--state", args.state)
+          }
+
+          if (args.limit && args.limit > 0) {
+            listArgs.push("--limit", String(args.limit))
+          }
+
+          const result = await runLinear(listArgs, directory)
+          if (!result.ok) {
+            return `Failed to list issues: ${result.stderr || result.stdout}`
+          }
+
+          return result.stdout || "No issues found matching criteria."
+        },
+      }),
+
+      linear_workflow_config: tool({
+        description: "View or update Linear workflow configuration (project, team, labels).",
+        args: {
+          action: tool.schema.enum(["view", "set", "clear"]).describe("Config action"),
+          key: tool.schema.enum(["project", "team", "labels", "defaultState"]).optional().describe("Config key to set/clear"),
+          value: tool.schema.string().optional().describe("Value to set (comma-separated for labels)"),
+        },
+        async execute(args) {
+          if (args.action === "view") {
+            const cfg = await loadConfig(directory)
+            const lines = [
+              "Linear Workflow Configuration",
+              "",
+              `Project: ${cfg.project || "(not set)"}`,
+              `Team: ${cfg.team || "(not set)"}`,
+              `Labels: ${cfg.labels?.join(", ") || "(not set)"}`,
+              `Default State: ${cfg.defaultState || "backlog"}`,
+              "",
+              "Config files searched (in order):",
+              ...getConfigPaths(directory).map(p => `  - ${p}`),
+            ]
+            return lines.join("\n")
+          }
+
+          if (args.action === "clear") {
+            if (!args.key) {
+              return "Error: 'key' is required for clear action"
+            }
+
+            const configPath = path.join(directory, ".opencode", "linear-workflow.json")
+            try {
+              const file = Bun.file(configPath)
+              let cfg: LinearWorkflowConfig = {}
+              if (await file.exists()) {
+                const content = await file.text()
+                cfg = JSON.parse(content)
+              }
+
+              if (args.key === "labels") {
+                delete cfg.labels
+              } else {
+                delete (cfg as any)[args.key]
+              }
+
+              await Bun.write(configPath, JSON.stringify(cfg, null, 2))
+              cachedConfig = null
+              return `Cleared ${args.key} from config`
+            } catch (error) {
+              return `Failed to clear config: ${error instanceof Error ? error.message : String(error)}`
+            }
+          }
+
+          if (args.action === "set") {
+            if (!args.key) {
+              return "Error: 'key' is required for set action"
+            }
+            if (args.value === undefined) {
+              return "Error: 'value' is required for set action"
+            }
+
+            const configDir = path.join(directory, ".opencode")
+            const configPath = path.join(configDir, "linear-workflow.json")
+
+            const mkdirProc = Bun.spawn(["mkdir", "-p", configDir])
+            await mkdirProc.exited
+
+            let cfg: LinearWorkflowConfig = {}
+            try {
+              const file = Bun.file(configPath)
+              if (await file.exists()) {
+                const content = await file.text()
+                cfg = JSON.parse(content)
+              }
+            } catch {
+              cfg = {}
+            }
+
+            if (args.key === "labels") {
+              cfg.labels = args.value.split(",").map(s => s.trim()).filter(Boolean)
+            } else {
+              (cfg as any)[args.key] = args.value
+            }
+
+            await Bun.write(configPath, JSON.stringify(cfg, null, 2))
+            cachedConfig = null
+            return `Set ${args.key} = ${args.key === "labels" ? cfg.labels?.join(", ") : args.value}`
+          }
+
+          return "Unknown action"
+        },
+      }),
+    },
+
+    "chat.message": async (input, output) => {
+      const userText = extractUserText(output.parts as any[])
+      if (!userText) return
+
+      if (userText.startsWith("/issue-start")) return
+      if (userText.startsWith("/issue-review")) return
+      if (userText.startsWith("/issue-close")) return
+      if (userText.startsWith("/issue-cancel")) return
+
+      await syncUserMessageIfBound(input.sessionID, userText)
+    },
+
+    "tool.execute.after": async (input) => {
+      if (input.tool !== "task") return
+
+      const sessionIssue = getSessionIssue(database, input.sessionID)
+      if (!sessionIssue) return
+
+      const summary = [
+        "### Task Completion",
+        "",
+        `Session: ${input.sessionID}`,
+        `Time: ${nowIso()}`,
+        `Tool: ${input.tool}`,
+        "",
+        "A delegated task finished successfully.",
+      ].join("\n")
+
+      const added = await addCommentViaTempFile(sessionIssue.issueId, summary, directory)
+      if (!added.ok) {
+        log.warn(`Failed to sync task completion comment: ${added.error ?? "unknown"}`)
+      }
+    },
+
+
+  }
+}
+
+export default LinearWorkflowPlugin

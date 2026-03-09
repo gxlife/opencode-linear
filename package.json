@@ -1,0 +1,44 @@
+{
+  "name": "opencode-linear",
+  "version": "1.0.0",
+  "description": "Linear issue workflow plugin for OpenCode - sync tasks, track progress, manage issue lifecycle",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "fmt": "prettier --write .",
+    "lint": "eslint src/**/*.ts"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "linear",
+    "issue-tracking",
+    "workflow",
+    "productivity"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/opencode-linear.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/opencode-linear/issues"
+  },
+  "homepage": "https://github.com/yourusername/opencode-linear#readme",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.0.0"
+  }
+}

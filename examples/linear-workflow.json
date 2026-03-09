@@ -1,0 +1,6 @@
+{
+  "project": "MyProject",
+  "team": "Engineering",
+  "labels": ["ai-assisted", "opencode"],
+  "defaultState": "backlog"
+}
