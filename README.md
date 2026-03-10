@@ -3,72 +3,125 @@
 [![npm version](https://img.shields.io/npm/v/opencode-linear.svg)](https://www.npmjs.com/package/opencode-linear)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Linear issue workflow plugin for [OpenCode](https://opencode.ai/).
+> 🌐 [English](README.md) | [简体中文](README.zh-CN.md)
 
-This project now uses **OpenCode Commands** for slash commands, not skills.
+Seamlessly manage Linear workflows in OpenCode. Automatically sync session state, track progress, and drive issue lifecycle without leaving your editor.
 
-## Features
-
-- Session binding with Linear issues
-- Issue lifecycle updates (in progress / in review / completed / canceled)
-- Automatic comment sync from conversation and delegated tasks
-- Project/team/labels/default-state config support
-
-## Prerequisites
-
-- OpenCode installed
-- Linear CLI installed and authenticated
+## ✨ Workflow in Action
 
 ```bash
+# Bind an existing issue or create from text
+/issue-start ENG-123
+# → Auto-linked, state transitions: backlog → in_progress
+
+# Or use natural language
+/issue-start "Refactor auth module to support OAuth2"
+# → Intelligently matches existing issues or creates new
+
+# Focus on coding, progress syncs to Linear automatically
+# ...Your conversations and task completions are recorded...
+
+# State transitions feel natural
+/issue-review      # → in_review
+/issue-close       # → completed  
+/issue-cancel      # → canceled
+```
+
+## 🎯 Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Session Persistence** | SQLite storage for session-issue binding, survives across conversations |
+| **Smart Issue Matching** | `/issue-start` prioritizes existing issues, prevents duplicates |
+| **Auto State Promotion** | backlog/todo automatically moves to in_progress, no manual clicks |
+| **Automatic Comment Sync** | Conversation and task completion auto-synced to Linear comments |
+| **Worktree Aware** | Git worktrees share the same project ID, data stays consolidated |
+| **Zero-Config Defaults** | Works out of the box with sensible defaults |
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+```bash
+# 1. Install Linear CLI and authenticate
 npm install -g @schpet/linear-cli
 linear auth login
-```
 
-## Install
-
-```bash
+# 2. Install the plugin
 npm install -g opencode-linear
+# postinstall automatically configures commands and plugin
 ```
 
-`postinstall` will automatically:
-
-- copy `commands/*.md` to `~/.config/opencode/commands/`
-- ensure `opencode-linear` exists in `~/.config/opencode/opencode.json` `plugin` array
-
-After install, you can directly use:
-
-- `/issue-start <issue-id-or-text>`
-- `/issue-review`
-- `/issue-close`
-- `/issue-cancel`
-
-`/issue-start` behavior:
-
-- prefer binding an existing issue inferred from user input
-- ask user to choose bind-or-create when matching is ambiguous
-- create a new issue only when no suitable existing issue is found
-
-If you want to skip automatic setup:
+### Getting Started
 
 ```bash
-OPENCODE_LINEAR_SKIP_POSTINSTALL=1 npm install -g opencode-linear
+# Option 1: Bind an existing issue
+/issue-start PROJ-123
+
+# Option 2: Describe your need, smart match or create
+/issue-start "Optimize database query performance"
+
+# Check current binding
+What is my current Linear issue?
 ```
 
-Uninstall will automatically clean up the resources installed by this package:
+## ⚙️ Configuration (Optional)
 
-- remove copied `commands/issue-*.md` under `~/.config/opencode/commands/`
-- remove `~/.config/opencode/plugin/opencode-linear.js`
-- remove `opencode-linear` from `~/.config/opencode/opencode.json` `plugin` array
-
-Manual config (only needed when postinstall is skipped):
+Create `.opencode/linear-workflow.json`:
 
 ```json
 {
-  "plugin": ["opencode-linear"]
+  "project": "YourProject",
+  "team": "Engineering", 
+  "labels": ["agent-workflow"],
+  "defaultState": "backlog"
 }
 ```
 
-## Local Dev Install
+Configuration precedence:
+1. `./.opencode/linear-workflow.json`
+2. `~/.config/opencode/linear-workflow.json`
+
+## 🔧 Tools Provided
+
+| Tool | Purpose |
+|------|---------|
+| `linear_workflow_start` | Bind/create issue, auto-promote state |
+| `linear_workflow_update` | Update state (in_progress/in_review/completed/canceled) |
+| `linear_sync_comment` | Add comment to current bound issue |
+| `linear_get_current_issue` | Get current session's bound issue |
+| `linear_workflow_list` | List existing issues (supports project/team filters) |
+| `linear_workflow_config` | View/modify workflow configuration |
+
+## 📝 Command Reference
+
+### `/issue-start <issue-id-or-text>`
+
+The smartest entry point:
+
+1. **Input is issue ID** (e.g., `ENG-123`): Directly bind that issue
+2. **Input is description text**:
+   - Searches existing issues for semantic matching
+   - High confidence match → Prompts user to bind
+   - Low confidence/no match → Creates new issue
+
+### State Transition Commands
+
+```bash
+/issue-review   # Mark as review state
+/issue-close    # Mark as completed
+/issue-cancel   # Mark as canceled
+```
+
+## 🏗️ Architecture
+
+Two-layer design:
+- **Plugin Layer** (`src/`): Provides runtime tools and hooks
+- **Command Layer** (`commands/`): OpenCode slash command templates
+
+Detailed architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+
+## 💻 Local Development
 
 ```bash
 git clone https://github.com/gxlife/opencode-linear.git
@@ -76,50 +129,32 @@ cd opencode-linear
 npm install
 npm run build
 
+# Manual link to OpenCode
 mkdir -p ~/.config/opencode/plugins ~/.config/opencode/commands
 ln -sf $(pwd)/dist/index.js ~/.config/opencode/plugins/opencode-linear.js
 cp -r $(pwd)/commands/* ~/.config/opencode/commands/
 ```
 
-## Configuration
-
-Create `.opencode/linear-workflow.json` (project-level) or `~/.config/opencode/linear-workflow.json` (global):
-
-```json
-{
-  "project": "YourProject",
-  "team": "Engineering",
-  "labels": ["agent-workflow"],
-  "defaultState": "backlog"
-}
-```
-
-## Tools Exposed by Plugin
-
-- `linear_workflow_start`
-- `linear_workflow_update`
-- `linear_sync_comment`
-- `linear_get_current_issue`
-- `linear_workflow_list`
-- `linear_workflow_config`
-
-## Commands Included
-
-- `commands/issue-start.md`
-- `commands/issue-review.md`
-- `commands/issue-close.md`
-- `commands/issue-cancel.md`
-
-## Development
+### Development Commands
 
 ```bash
-npm install
-npm run check
-npm run build
+npm run build      # Compile TypeScript
+npm run check      # Type check
+npm run fmt        # Format code
+npm run lint       # Lint code
 ```
 
-See `docs/ARCHITECTURE.md` for plugin + command architecture.
+## 📦 Technical Details
 
-## License
+- **Runtime**: Bun (uses `bun:sqlite` for persistence)
+- **State Storage**: `~/.local/share/opencode/plugins/linear-workflow/{project-id}.sqlite`
+- **Project ID**: Git first root commit SHA (supports worktrees)
+- **Issue ID Format**: `^[A-Z][A-Z0-9]+-\d+$` (e.g., ENG-123)
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## 📄 License
 
 MIT
