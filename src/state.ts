@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { z } from "zod"
-import { getProjectId } from "../kdco-primitives/get-project-id"
+import { getProjectId } from "./utils/project-id"
 
 export interface SessionIssue {
   sessionId: string

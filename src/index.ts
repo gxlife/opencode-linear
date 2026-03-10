@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
@@ -29,6 +29,8 @@ interface LinearWorkflowConfig {
 
 let db: Database | null = null
 let cachedConfig: LinearWorkflowConfig | null = null
+let cachedConfigPath: string | null = null
+let cachedConfigMtime: number = 0
 
 function normalizeText(input: unknown): string {
   return typeof input === "string" ? input : ""
@@ -53,7 +55,8 @@ function issueIdFromText(output: string): string | null {
 }
 
 function compactText(text: string, max = 1200): string {
-  const normalized = text.trim().replace(/\n{3,}/g, "\n\n")
+  const withoutPlaceholders = text.trim().replace(/\[Pasted ~\d+ lines?\]/g, "")
+  const normalized = withoutPlaceholders.replace(/\n{3,}/g, "\n\n")
   return normalized.length > max ? `${normalized.slice(0, max)}\n\n...` : normalized
 }
 
@@ -151,16 +154,6 @@ async function addCommentViaTempFile(issueId: string, content: string, cwd: stri
   }
 }
 
-function extractUserText(parts: any[]): string {
-  const texts: string[] = []
-  for (const part of parts ?? []) {
-    if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
-      texts.push(part.text)
-    }
-  }
-  return texts.join("\n").trim()
-}
-
 function nowIso(): string {
   return new Date().toISOString()
 }
@@ -205,16 +198,50 @@ function getConfigPaths(directory: string): string[] {
   ]
 }
 
-async function loadConfig(directory: string): Promise<LinearWorkflowConfig> {
-  if (cachedConfig) return cachedConfig
-
+async function hasConfigChanged(directory: string): Promise<{ changed: boolean; path: string | null; mtime: number }> {
   const configPaths = getConfigPaths(directory)
 
   for (const configPath of configPaths) {
     try {
-      const file = Bun.file(configPath)
+      const fileStat = await stat(configPath)
+      if (fileStat.isFile()) {
+        const mtime = fileStat.mtimeMs
+        if (cachedConfigPath === configPath && cachedConfigMtime === mtime) {
+          return { changed: false, path: configPath, mtime }
+        }
+        return { changed: true, path: configPath, mtime }
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return { changed: cachedConfigPath !== null, path: null, mtime: 0 }
+}
+
+async function loadConfig(directory: string, log?: Logger): Promise<LinearWorkflowConfig> {
+  const { changed, path: configPath, mtime } = await hasConfigChanged(directory)
+
+  if (!changed && cachedConfig) {
+    log?.debug(`Using cached Linear workflow config from ${cachedConfigPath}`)
+    return cachedConfig
+  }
+
+  if (cachedConfig && changed && configPath) {
+    log?.info(`Config file changed, reloading from ${configPath}`)
+  }
+
+  const configPaths = getConfigPaths(directory)
+
+  for (const currentPath of configPaths) {
+    try {
+      const file = Bun.file(currentPath)
       if (!(await file.exists())) continue
 
+      const fileStat = await stat(currentPath)
+      const currentMtime = fileStat.mtimeMs
+
+      log?.debug(`Loading Linear workflow config from: ${currentPath}`)
       const content = await file.text()
       const cleaned = content
         .replace(/\/\*[\s\S]*?\*\//g, "")
@@ -222,13 +249,21 @@ async function loadConfig(directory: string): Promise<LinearWorkflowConfig> {
         .replace(/,\s*([}\]])/g, "$1")
 
       cachedConfig = JSON.parse(cleaned) as LinearWorkflowConfig
+      cachedConfigPath = currentPath
+      cachedConfigMtime = currentMtime
+
+      log?.info(`Loaded Linear workflow config: project=${cachedConfig.project || "(none)"}, team=${cachedConfig.team || "(none)"}, labels=${cachedConfig.labels?.join(",") || "(none)"}`)
       return cachedConfig
-    } catch {
+    } catch (err) {
+      log?.warn(`Failed to parse config at ${currentPath}: ${err instanceof Error ? err.message : String(err)}`)
       continue
     }
   }
 
+  log?.debug("No Linear workflow config found, using defaults")
   cachedConfig = {}
+  cachedConfigPath = null
+  cachedConfigMtime = 0
   return cachedConfig
 }
 
@@ -281,27 +316,7 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
   }
 
   const database = await ensureDb(directory)
-  const config = await loadConfig(directory)
-
-  const syncUserMessageIfBound = async (sessionID: string, userText: string): Promise<void> => {
-    if (!userText) return
-    const sessionIssue = getSessionIssue(database, sessionID)
-    if (!sessionIssue) return
-
-    const body = [
-      "### User Input",
-      "",
-      `Session: ${sessionID}`,
-      `Time: ${nowIso()}`,
-      "",
-      compactText(userText, 4000),
-    ].join("\n")
-
-    const added = await addCommentViaTempFile(sessionIssue.issueId, body, directory)
-    if (!added.ok) {
-      log.warn(`Failed to sync user message comment: ${added.error ?? "unknown"}`)
-    }
-  }
+  const config = await loadConfig(directory, log)
 
   return {
     tool: {
@@ -424,13 +439,13 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
       }),
 
       linear_sync_comment: tool({
-        description: "Add a markdown comment to the current bound Linear issue.",
+        description: "Add a markdown comment to the current bound Linear issue. Use this when agent has meaningful progress or decisions to document.",
         args: {
           content: tool.schema.string().describe("Comment markdown content"),
           kind: tool.schema
-            .enum(["progress", "user_message", "note"])
+            .enum(["progress", "note"])
             .optional()
-            .describe("Comment category for traceability"),
+            .describe("Comment category: progress for milestones, note for observations/decisions"),
         },
         async execute(args, toolCtx) {
           const sessionIssue = getSessionIssue(database, toolCtx.sessionID)
@@ -438,12 +453,7 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
             return "No bound issue for this session. Run /issue-start first."
           }
 
-          const header =
-            args.kind === "user_message"
-              ? "### User Message"
-              : args.kind === "progress"
-                ? "### Progress Update"
-                : "### Note"
+          const header = args.kind === "progress" ? "### Progress Update" : "### Note"
 
           const body = [
             header,
@@ -548,6 +558,8 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
 
               await Bun.write(configPath, JSON.stringify(cfg, null, 2))
               cachedConfig = null
+              cachedConfigPath = null
+              cachedConfigMtime = 0
               return `Cleared ${args.key} from config`
             } catch (error) {
               return `Failed to clear config: ${error instanceof Error ? error.message : String(error)}`
@@ -587,6 +599,8 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
 
             await Bun.write(configPath, JSON.stringify(cfg, null, 2))
             cachedConfig = null
+            cachedConfigPath = null
+            cachedConfigMtime = 0
             return `Set ${args.key} = ${args.key === "labels" ? cfg.labels?.join(", ") : args.value}`
           }
 
@@ -594,42 +608,6 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
         },
       }),
     },
-
-    "chat.message": async (input, output) => {
-      const userText = extractUserText(output.parts as any[])
-      if (!userText) return
-
-      if (userText.startsWith("/issue-start")) return
-      if (userText.startsWith("/issue-review")) return
-      if (userText.startsWith("/issue-close")) return
-      if (userText.startsWith("/issue-cancel")) return
-
-      await syncUserMessageIfBound(input.sessionID, userText)
-    },
-
-    "tool.execute.after": async (input) => {
-      if (input.tool !== "task") return
-
-      const sessionIssue = getSessionIssue(database, input.sessionID)
-      if (!sessionIssue) return
-
-      const summary = [
-        "### Task Completion",
-        "",
-        `Session: ${input.sessionID}`,
-        `Time: ${nowIso()}`,
-        `Tool: ${input.tool}`,
-        "",
-        "A delegated task finished successfully.",
-      ].join("\n")
-
-      const added = await addCommentViaTempFile(sessionIssue.issueId, summary, directory)
-      if (!added.ok) {
-        log.warn(`Failed to sync task completion comment: ${added.error ?? "unknown"}`)
-      }
-    },
-
-
   }
 }
 

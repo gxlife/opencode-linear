@@ -7,10 +7,15 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
+    "commands",
+    "examples",
+    "scripts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
+    "postinstall": "node ./scripts/postinstall.js",
+    "preuninstall": "node ./scripts/preuninstall.js",
     "build": "tsc",
     "check": "tsc --noEmit",
     "fmt": "prettier --write .",
@@ -37,6 +42,9 @@
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.0.0",
     "@schpet/linear-cli": "^1.11.0"
+  },
+  "dependencies": {
+    "zod": "^3.22.0"
   },
   "devDependencies": {
     "@types/bun": "^1.0.0",
