@@ -40,6 +40,31 @@ function isIssueIdentifier(input: string): boolean {
   return /^[A-Z][A-Z0-9]+-\d+$/.test(input.trim())
 }
 
+/**
+ * Parse input to extract issue ID and task description
+ * Supports formats:
+ *   - "ENG-123" (just issue ID)
+ *   - "ENG-123 implement login feature" (issue ID + task)
+ *   - "implement login feature" (just task description)
+ */
+function parseIssueInput(input: string): { issueId: string | null; taskDescription: string } {
+  const trimmed = input.trim()
+  
+  // Match issue ID at the start followed by optional task description
+  // Pattern: ISSUE-ID at start, optionally followed by space and description
+  const match = trimmed.match(/^([A-Z][A-Z0-9]+-\d+)(?:\s+(.*))?$/s)
+  
+  if (match) {
+    return {
+      issueId: match[1],
+      taskDescription: match[2]?.trim() || ""
+    }
+  }
+  
+  // No issue ID found, treat entire input as task description
+  return { issueId: null, taskDescription: trimmed }
+}
+
 function extractTitleFromInput(input: string): string {
   const firstLine = input
     .split(/\r?\n/)
@@ -332,14 +357,17 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
             return "Input is empty. Provide an issue id like ENG-123 or requirement text."
           }
 
+          const { issueId, taskDescription } = parseIssueInput(rawInput)
           let issue: IssueDetails | null = null
-          let taskPrompt = rawInput
+          let taskPrompt = taskDescription || rawInput
 
-          if (isIssueIdentifier(rawInput)) {
-            const viewed = await runLinear(["issue", "view", rawInput, "--json", "--no-comments"], directory)
+          if (issueId) {
+            const viewed = await runLinear(["issue", "view", issueId, "--json", "--no-comments"], directory)
             if (viewed.ok) {
-              issue = extractIssueFromJson(viewed.stdout, rawInput)
-              if (issue) {
+              issue = extractIssueFromJson(viewed.stdout, issueId)
+              if (issue && taskDescription) {
+                taskPrompt = `${taskDescription}\n\n(Context: ${issue.title}${issue.description ? ` - ${issue.description.slice(0, 200)}` : ""})`
+              } else if (issue) {
                 taskPrompt = issue.description || issue.title
               }
             }
