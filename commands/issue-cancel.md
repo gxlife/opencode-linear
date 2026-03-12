@@ -12,4 +12,4 @@ Must do:
 }
 ```
 
-2. Return the tool output in Chinese.
+2. Return the tool output.

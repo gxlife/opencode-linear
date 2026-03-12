@@ -21,7 +21,7 @@ You are running the `/issue-review` command for opencode-linear.
 }
 ```
 
-3. Return the tool output in Chinese.
+3. Return the tool output.
 
 ## Why sync before review?
 
