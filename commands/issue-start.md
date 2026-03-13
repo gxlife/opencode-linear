@@ -15,20 +15,72 @@ You are running the `/issue-start` command for opencode-linear.
    - **Format C**: `implement user login with JWT` - Just task description (no issue ID)
 
 4. If an issue ID was found (Format A or B):
-   - Call `linear_workflow_start` with the combined input: `"$ARGUMENTS"`
-   - This will bind the existing issue and use the task description (if provided) as the task prompt
+   - Extract the issue ID (e.g., `ENG-123`)
+   - Extract any additional task description text (if present in Format B)
+   - Call `linear_workflow_bind_issue` with:
+     - `issueId`: the extracted issue ID
+     - `taskDescription`: any additional description text (can be empty)
+   - The tool will:
+     - Validate the issue exists
+     - Update state to `in_progress` (if currently in backlog/todo)
+     - Bind the issue to current session
+     - Return a `TASK_PROMPT` for execution
+   - **Proceed with the returned TASK_PROMPT** - do not ask user for confirmation
 
 5. If no issue ID was found (Format C):
-   - First, try to find and bind an existing issue:
-     - Call `linear_workflow_list` to fetch candidate issues (limit: 30-50)
-     - Match candidates using the task description semantics
-     - If there is one clear best match, call `linear_workflow_start` with that issue id
-   - If matching confidence is low or there are multiple similarly good candidates:
-     - Ask the user whether to bind one of the candidate issue ids, or create a new issue
-     - Provide a short candidate list and ask user to reply with an issue id or "create"
-   - If no suitable issue is found, call `linear_workflow_start` with the task description to create a new issue
+   - Extract the task title from the first line of input
+   - Call `linear_workflow_create_issue` with:
+     - `title`: the extracted title (max 120 chars)
+     - `description`: the full input text as description
+   - The tool will create a new issue and return the issue details including `issueId`
+   - **Immediately** call `linear_workflow_bind_issue` with:
+     - `issueId`: the newly created issue ID from the previous step
+     - `taskDescription`: "" (empty, since the description is already in the issue)
+   - The tool will bind the newly created issue to the session and return a `TASK_PROMPT`
+   - **Proceed with the returned TASK_PROMPT** - do not ask user for confirmation
 
-6. Return the tool result and a concise next step.
+6. **Execute the task**: Once you have the `TASK_PROMPT` from either step 4 or 5, immediately start working on it. Do not ask the user "what would you like me to do" - the task description is already provided.
+
+7. **Before replying after meaningful work**, call `linear_workflow_checkpoint` with a concise summary of what was just completed.
+   - Use this after a meaningful work segment such as:
+     - implementation completed for a sub-task
+     - bug root cause confirmed and fixed
+     - a stable architectural or workflow decision was made
+     - a long analysis produced a final conclusion
+   - Do **not** call it for routine file reads, vague WIP updates, or inconclusive trial-and-error.
+   - If the tool returns `shouldSync: true`, immediately call `linear_sync_comment` with:
+     - `content`: the returned `content`
+     - `kind`: the returned `kind`
+   - Only after that should you reply to the user.
+
+## Summary of tool calls:
+
+**With issue ID:**
+```
+linear_workflow_bind_issue({ issueId: "ENG-123", taskDescription: "additional context" })
+→ Returns TASK_PROMPT
+→ Execute TASK_PROMPT immediately
+```
+
+**Without issue ID:**
+```
+linear_workflow_create_issue({ title: "Task title", description: "Full description" })
+→ Returns { issueId: "ENG-124", ... }
+linear_workflow_bind_issue({ issueId: "ENG-124", taskDescription: "" })
+→ Returns TASK_PROMPT
+→ Execute TASK_PROMPT immediately
+```
+
+**After meaningful work is completed:**
+```
+linear_workflow_checkpoint({
+  summary: "Completed the command flow split and wired checkpoint support into issue-start.",
+  kindHint: "auto"
+})
+→ Returns { shouldSync, kind, content, reason }
+→ If shouldSync=true, call linear_sync_comment({ content, kind })
+→ Then reply to the user
+```
 
 ## Progress Sync Guidelines (CRITICAL - YOU MUST FOLLOW THIS):
 

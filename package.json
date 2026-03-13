@@ -1,6 +1,6 @@
 {
   "name": "opencode-linear",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Linear issue workflow plugin for OpenCode - sync tasks, track progress, manage issue lifecycle",
   "type": "module",
   "main": "./dist/index.js",

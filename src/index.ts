@@ -4,7 +4,16 @@ import * as os from "node:os"
 import * as path from "node:path"
 import { type Plugin, tool } from "@opencode-ai/plugin"
 
-import { getSessionIssue, initLinearWorkflowDb, upsertSessionIssue } from "./state"
+import {
+  ensureSessionSyncState,
+  getSessionIssue,
+  getSessionSyncState,
+  initLinearWorkflowDb,
+  recordSessionSync,
+  upsertSessionIssue,
+  upsertSessionSyncState,
+} from "./state"
+import { computeSyncFingerprint, createSyncCandidateContent, evaluateSyncCheckpoint } from "./utils/sync-checkpoint"
 
 interface Logger {
   debug: (msg: string) => void
@@ -83,6 +92,18 @@ function compactText(text: string, max = 1200): string {
   const withoutPlaceholders = text.trim().replace(/\[Pasted ~\d+ lines?\]/g, "")
   const normalized = withoutPlaceholders.replace(/\n{3,}/g, "\n\n")
   return normalized.length > max ? `${normalized.slice(0, max)}\n\n...` : normalized
+}
+
+function looksLikeFormattedSyncComment(content: string): boolean {
+  const trimmed = content.trimStart()
+  return trimmed.startsWith("### Progress Update") || trimmed.startsWith("### Note")
+}
+
+function inferSyncKind(content: string, explicitKind?: "progress" | "note"): "progress" | "note" {
+  if (explicitKind) {
+    return explicitKind
+  }
+  return content.trimStart().startsWith("### Note") ? "note" : "progress"
 }
 
 async function runLinear(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
@@ -188,6 +209,10 @@ async function ensureDb(directory: string): Promise<Database> {
     db = await initLinearWorkflowDb(directory)
   }
   return db
+}
+
+function buildCheckpointSummary(summary: string): string {
+  return compactText(summary, 1000)
 }
 
 function buildStartResponse(issue: IssueDetails, startedState: string | null, taskPrompt: string): string {
@@ -345,71 +370,85 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
 
   return {
     tool: {
-      linear_workflow_start: tool({
+      linear_workflow_create_issue: tool({
         description:
-          "Start workflow from Linear issue or create one from input, then bind current session to that issue. Respects project/team/labels config.",
+          "Create a new Linear issue from task description. Returns the created issue ID and details. Respects project/team/labels config.",
         args: {
-          input: tool.schema.string().describe("Issue identifier or natural language requirement text"),
+          title: tool.schema.string().describe("Issue title (required)"),
+          description: tool.schema.string().optional().describe("Issue description (optional, defaults to title)"),
+        },
+        async execute(args) {
+          const title = args.title.trim()
+          if (!title) {
+            return "Title is required to create an issue."
+          }
+
+          const description = args.description?.trim() || title
+          const tempDir = await mkdtemp(path.join(os.tmpdir(), "linear-workflow-"))
+          const descriptionFile = path.join(tempDir, "description.md")
+
+          try {
+            await writeFile(descriptionFile, description, "utf8")
+            const createArgs = buildCreateArgs(title, descriptionFile, config)
+            const created = await runLinear(createArgs, directory)
+
+            if (!created.ok) {
+              return `Failed to create issue: ${created.stderr || created.stdout}`
+            }
+
+            const createdIssueId = issueIdFromText(created.stdout)
+            if (!createdIssueId) {
+              return `Issue may have been created, but identifier could not be parsed. Output: ${created.stdout}`
+            }
+
+            const viewed = await runLinear(["issue", "view", createdIssueId, "--json", "--no-comments"], directory)
+            if (!viewed.ok) {
+              return `Issue created (${createdIssueId}), but failed to view details: ${viewed.stderr || viewed.stdout}`
+            }
+
+            const issue = extractIssueFromJson(viewed.stdout, createdIssueId)
+            if (!issue) {
+              return `Issue created (${createdIssueId}), but failed to parse details.`
+            }
+
+            return JSON.stringify({
+              success: true,
+              issueId: issue.issueId,
+              title: issue.title,
+              stateName: issue.stateName,
+              description: issue.description,
+            }, null, 2)
+          } finally {
+            await rm(tempDir, { recursive: true, force: true })
+          }
+        },
+      }),
+
+      linear_workflow_bind_issue: tool({
+        description:
+          "Bind an existing Linear issue to current session, update state to in_progress, and return task context. Use this to start working on an issue.",
+        args: {
+          issueId: tool.schema.string().describe("Linear issue identifier (e.g., ENG-123)"),
+          taskDescription: tool.schema.string().optional().describe("Optional additional task description to supplement the issue"),
         },
         async execute(args, toolCtx) {
-          const rawInput = args.input.trim()
-          if (!rawInput) {
-            return "Input is empty. Provide an issue id like ENG-123 or requirement text."
+          const issueId = args.issueId.trim()
+          if (!issueId) {
+            return "Issue ID is required."
           }
 
-          const { issueId, taskDescription } = parseIssueInput(rawInput)
-          let issue: IssueDetails | null = null
-          let taskPrompt = taskDescription || rawInput
-
-          if (issueId) {
-            const viewed = await runLinear(["issue", "view", issueId, "--json", "--no-comments"], directory)
-            if (viewed.ok) {
-              issue = extractIssueFromJson(viewed.stdout, issueId)
-              if (issue && taskDescription) {
-                taskPrompt = `${taskDescription}\n\n(Context: ${issue.title}${issue.description ? ` - ${issue.description.slice(0, 200)}` : ""})`
-              } else if (issue) {
-                taskPrompt = issue.description || issue.title
-              }
-            }
+          if (!isIssueIdentifier(issueId)) {
+            return `Invalid issue ID format: ${issueId}. Expected format: ENG-123`
           }
 
+          const viewed = await runLinear(["issue", "view", issueId, "--json", "--no-comments"], directory)
+          if (!viewed.ok) {
+            return `Failed to find issue ${issueId}: ${viewed.stderr || viewed.stdout}`
+          }
+
+          const issue = extractIssueFromJson(viewed.stdout, issueId)
           if (!issue) {
-            const title = extractTitleFromInput(rawInput)
-            const tempDir = await mkdtemp(path.join(os.tmpdir(), "linear-workflow-"))
-            const descriptionFile = path.join(tempDir, "description.md")
-
-            try {
-              await writeFile(descriptionFile, rawInput, "utf8")
-              const createArgs = buildCreateArgs(title, descriptionFile, config)
-              const created = await runLinear(createArgs, directory)
-
-              if (!created.ok) {
-                return `Failed to create issue: ${created.stderr || created.stdout}`
-              }
-
-              const createdIssueId = issueIdFromText(created.stdout)
-              if (!createdIssueId) {
-                return `Issue may have been created, but identifier could not be parsed. Output: ${created.stdout}`
-              }
-
-              const viewed = await runLinear(["issue", "view", createdIssueId, "--json", "--no-comments"], directory)
-              if (!viewed.ok) {
-                return `Issue created (${createdIssueId}), but failed to view details: ${viewed.stderr || viewed.stdout}`
-              }
-
-              issue = extractIssueFromJson(viewed.stdout, createdIssueId)
-              if (!issue) {
-                return `Issue created (${createdIssueId}), but failed to parse details.`
-              }
-
-              taskPrompt = rawInput
-            } finally {
-              await rm(tempDir, { recursive: true, force: true })
-            }
-          }
-
-          if (!issue) {
-            return "Failed to start workflow: issue resolution failed."
+            return `Found issue ${issueId}, but failed to parse details.`
           }
 
           let startedState: string | null = null
@@ -421,13 +460,27 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
             }
           }
 
+          const timestamp = nowIso()
+
           upsertSessionIssue(database, {
             sessionId: toolCtx.sessionID,
             issueId: issue.issueId,
             issueTitle: issue.title,
             issueState: issue.stateName || "",
-            updatedAt: nowIso(),
+            updatedAt: timestamp,
           })
+          ensureSessionSyncState(database, {
+            sessionId: toolCtx.sessionID,
+            issueId: issue.issueId,
+            now: timestamp,
+          })
+
+          let taskPrompt = args.taskDescription?.trim() || ""
+          if (taskPrompt) {
+            taskPrompt = `${taskPrompt}\n\n(Context: ${issue.title}${issue.description ? ` - ${issue.description.slice(0, 200)}` : ""})`
+          } else {
+            taskPrompt = issue.description || issue.title
+          }
 
           return buildStartResponse(issue, startedState, taskPrompt)
         },
@@ -466,6 +519,69 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
         },
       }),
 
+      linear_workflow_checkpoint: tool({
+        description:
+          "Evaluate whether the latest completed work segment should be synced to the bound Linear issue. Use this before replying after meaningful work.",
+        args: {
+          summary: tool.schema.string().describe("Concise summary of the work segment that just completed"),
+          kindHint: tool.schema
+            .enum(["progress", "note", "auto"])
+            .optional()
+            .describe("Optional hint for whether this is progress, a decision note, or auto-detected"),
+          force: tool.schema.boolean().optional().describe("Force a stronger sync check before review or close"),
+        },
+        async execute(args, toolCtx) {
+          const sessionIssue = getSessionIssue(database, toolCtx.sessionID)
+          if (!sessionIssue) {
+            return "No bound issue for this session. Run /issue-start first."
+          }
+
+          const timestamp = nowIso()
+          const syncState = ensureSessionSyncState(database, {
+            sessionId: toolCtx.sessionID,
+            issueId: sessionIssue.issueId,
+            now: timestamp,
+          })
+          const summary = buildCheckpointSummary(args.summary)
+          const result = evaluateSyncCheckpoint({
+            syncState,
+            summary,
+            kindHint: args.kindHint,
+            force: args.force,
+            now: timestamp,
+          })
+
+          const nextSyncState = {
+            ...syncState,
+            lastCheckpointAt: timestamp,
+            pendingMilestone: result.shouldSync && result.kind === "progress" ? summary : null,
+            pendingDecision: result.shouldSync && result.kind === "note" ? summary : null,
+            pendingSummary: result.shouldSync ? summary : null,
+            syncRequiredBeforeReview: result.shouldSync ? 1 : syncState.syncRequiredBeforeReview,
+            syncRequiredBeforeClose: result.shouldSync ? 1 : syncState.syncRequiredBeforeClose,
+            updatedAt: timestamp,
+          }
+          upsertSessionSyncState(database, nextSyncState)
+
+          const payload = {
+            shouldSync: result.shouldSync,
+            reason: result.reason,
+            kind: result.kind,
+            content:
+              result.shouldSync && result.kind
+                ? createSyncCandidateContent({
+                    kind: result.kind,
+                    sessionId: toolCtx.sessionID,
+                    summary,
+                    now: timestamp,
+                  })
+                : null,
+          }
+
+          return JSON.stringify(payload, null, 2)
+        },
+      }),
+
       linear_sync_comment: tool({
         description: "Add a markdown comment to the current bound Linear issue. Use this when agent has meaningful progress or decisions to document.",
         args: {
@@ -481,23 +597,54 @@ export const LinearWorkflowPlugin: Plugin = async ({ client, directory }) => {
             return "No bound issue for this session. Run /issue-start first."
           }
 
-          const header = args.kind === "progress" ? "### Progress Update" : "### Note"
-
-          const body = [
-            header,
-            "",
-            `Session: ${toolCtx.sessionID}`,
-            `Time: ${nowIso()}`,
-            "",
-            compactText(args.content, 6000),
-          ].join("\n")
+          const timestamp = nowIso()
+          const normalizedContent = compactText(args.content, 6000)
+          const syncKind = inferSyncKind(normalizedContent, args.kind)
+          const body = looksLikeFormattedSyncComment(normalizedContent)
+            ? normalizedContent
+            : [
+                syncKind === "progress" ? "### Progress Update" : "### Note",
+                "",
+                `Session: ${toolCtx.sessionID}`,
+                `Time: ${timestamp}`,
+                "",
+                normalizedContent,
+              ].join("\n")
 
           const added = await addCommentViaTempFile(sessionIssue.issueId, body, directory)
           if (!added.ok) {
             return `Failed to add comment: ${added.error ?? "unknown"}`
           }
 
+          recordSessionSync(database, {
+            sessionId: toolCtx.sessionID,
+            issueId: sessionIssue.issueId,
+            kind: syncKind,
+            summary: normalizedContent,
+            fingerprint: computeSyncFingerprint(sessionIssue.issueId, syncKind, normalizedContent),
+            now: timestamp,
+          })
+
           return `Comment synced to ${sessionIssue.issueId}`
+        },
+      }),
+
+      linear_workflow_sync_status: tool({
+        description: "Get sync checkpoint state for the current bound issue and session.",
+        args: {},
+        async execute(_args, toolCtx) {
+          const sessionIssue = getSessionIssue(database, toolCtx.sessionID)
+          if (!sessionIssue) {
+            return "No bound issue for this session. Run /issue-start first."
+          }
+
+          const syncState = ensureSessionSyncState(database, {
+            sessionId: toolCtx.sessionID,
+            issueId: sessionIssue.issueId,
+            now: nowIso(),
+          })
+
+          return JSON.stringify(syncState, null, 2)
         },
       }),
 

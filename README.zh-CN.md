@@ -23,7 +23,7 @@
 
 # 状态流转自然无缝
 /issue-review      # → in_review
-/issue-close       # → completed  
+/issue-done        # → completed  
 /issue-cancel      # → canceled
 ```
 
@@ -34,7 +34,7 @@
 | **会话持久化** | SQLite 存储 session-issue 绑定，跨对话不丢失 |
 | **智能 issue 匹配** | `/issue-start` 优先匹配现有 issue，避免重复创建 |
 | **自动状态推进** | backlog/todo 自动进入 in_progress，无需手动点击 |
-| **自动评论同步** | 对话内容和任务完成自动同步到 Linear 评论 |
+| **基于 checkpoint 的同步** | 在有意义的工作段结束后先判断，再决定是否同步到 Linear 评论 |
 | **Worktree 感知** | Git worktree 共享同一 project ID，数据不分散 |
 | **零配置启动** | 安装即用，默认配置覆盖常见场景 |
 
@@ -86,9 +86,12 @@ What is my current Linear issue?
 
 | 工具 | 用途 |
 |------|------|
-| `linear_workflow_start` | 绑定/创建 issue，自动推进状态 |
+| `linear_workflow_create_issue` | 根据任务描述和默认配置创建新 issue |
+| `linear_workflow_bind_issue` | 将 issue 绑定到当前 session，并在需要时自动推进状态 |
 | `linear_workflow_update` | 更新状态 (in_progress/in_review/completed/canceled) |
+| `linear_workflow_checkpoint` | 判断一个已完成工作段是否应该同步到 Linear |
 | `linear_sync_comment` | 添加评论到当前绑定 issue |
+| `linear_workflow_sync_status` | 查看当前 session 的 checkpoint 同步状态 |
 | `linear_get_current_issue` | 获取当前会话绑定的 issue |
 | `linear_workflow_list` | 列出现有 issue（支持 project/team 过滤）|
 | `linear_workflow_config` | 查看/修改工作流配置 |
@@ -101,22 +104,31 @@ What is my current Linear issue?
 
 1. **输入是 issue ID**（如 `ENG-123`）：直接绑定该 issue
 2. **输入是描述文本**：
-   - 先搜索现有 issue 进行语义匹配
-   - 匹配度高 → 提示用户选择绑定
-   - 匹配度低/无匹配 → 创建新 issue
+   - 取首行作为标题、完整输入作为描述创建新 issue
+   - 自动将新 issue 绑定到当前 session
+
+### 自动同步 Checkpoint
+
+当一个有意义的工作段完成后，agent 应该：
+
+1. 调用 `linear_workflow_checkpoint`，传入本轮工作的简洁总结
+2. 如果 `shouldSync` 为 `true`，调用 `linear_sync_comment`
+3. 同步完成后再回复用户
+
+`/issue-review` 和 `/issue-done` 也会在切状态前先执行一次强制 checkpoint。
 
 ### 状态流转命令
 
 ```bash
 /issue-review   # 标记为 review 状态
-/issue-close    # 标记为已完成
+/issue-done     # 标记为已完成
 /issue-cancel   # 标记为已取消
 ```
 
 ## 🏗️ 架构说明
 
 双分层设计：
-- **Plugin 层** (`src/`): 提供 runtime tools 和 hooks
+- **Plugin 层** (`src/`): 提供 runtime tools 和基于 SQLite 的 session 状态
 - **Command 层** (`commands/`): OpenCode slash 命令模板
 
 详细架构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)

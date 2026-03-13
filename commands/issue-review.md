@@ -6,12 +6,17 @@ You are running the `/issue-review` command for opencode-linear.
 
 ## Must do:
 
-1. **Sync final progress** before state change (CRITICAL):
-   - Call `linear_sync_comment` to document the completed work:
-     - What was accomplished
-     - Key decisions made
-     - Any blockers or caveats
-   - Use `kind: "progress"`
+1. **Run a forced checkpoint** before state change (CRITICAL):
+   - Call `linear_workflow_checkpoint` with:
+
+```json
+{
+  "summary": "Provide a concise summary of the implementation results, decisions, testing status, and caveats.",
+  "force": true
+}
+```
+
+   - If the tool returns `shouldSync: true`, immediately call `linear_sync_comment` with the returned `content` and `kind`
 
 2. Call tool `linear_workflow_update` with:
 

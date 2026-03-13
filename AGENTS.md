@@ -11,14 +11,14 @@ OpenCode plugin for Linear issue workflow. Two-layer design: plugin layer (runti
 ```
 .
 ├── src/
-│   ├── index.ts          # Main plugin: 6 tools + hooks
-│   ├── state.ts          # SQLite session persistence
+│   ├── index.ts          # Main plugin: workflow tools + sync checkpoints
+│   ├── state.ts          # SQLite session + sync checkpoint persistence
 │   └── utils/
 │       └── project-id.ts # Git-based project ID for worktree support
 ├── commands/             # Slash command templates (OpenCode commands/)
 │   ├── issue-start.md
 │   ├── issue-review.md
-│   ├── issue-close.md
+│   ├── issue-done.md
 │   └── issue-cancel.md
 ├── scripts/
 │   ├── postinstall.js    # Auto-setup commands + plugin symlink
@@ -47,9 +47,12 @@ OpenCode plugin for Linear issue workflow. Two-layer design: plugin layer (runti
 ## TOOLS EXPOSED
 | Tool | Purpose |
 |------|---------|
-| `linear_workflow_start` | Bind/create issue, auto-promote state |
+| `linear_workflow_create_issue` | Create issue from task text + config |
+| `linear_workflow_bind_issue` | Bind issue to session, auto-promote state |
 | `linear_workflow_update` | Update state (in_progress/in_review/completed/canceled) |
+| `linear_workflow_checkpoint` | Evaluate whether a work segment should sync |
 | `linear_sync_comment` | Post progress/note comments to bound issue |
+| `linear_workflow_sync_status` | Inspect current sync checkpoint state |
 | `linear_get_current_issue` | Get current session's bound issue |
 | `linear_workflow_list` | List issues with project/team filters |
 | `linear_workflow_config` | View/set/clear workflow config |
@@ -80,5 +83,6 @@ npm run lint       # eslint src/**/*.ts
 ## NOTES
 - Uses Bun.spawn for CLI execution
 - Comments posted via temp files (body-file flag)
+- Sync uses checkpoint metadata stored in SQLite to survive long sessions and compression
 - Project ID uses first git root commit SHA for worktree consistency
 - Issue ID format: `^[A-Z][A-Z0-9]+-\d+$` (e.g., ENG-123)

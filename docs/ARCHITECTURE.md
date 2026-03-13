@@ -22,26 +22,33 @@ Reference: `https://opencode.ai/docs/zh-cn/commands/`
 Example: `/issue-start ENG-123`
 
 1. OpenCode resolves `commands/issue-start.md`
-2. Command template instructs model to call `linear_workflow_start`
+2. Command template decides whether to call `linear_workflow_bind_issue` directly or create via `linear_workflow_create_issue` first
 3. Plugin executes tool logic in `src/index.ts`
-4. Tool reads/writes session state in SQLite via `src/state.ts`
-5. Output is returned to user
+4. Tools read/write session and sync-checkpoint state in SQLite via `src/state.ts`
+5. After meaningful work, command templates call `linear_workflow_checkpoint` before replying
+6. If checkpoint says sync is needed, `linear_sync_comment` posts the comment to Linear
+7. Output is returned to user
 
 ## Plugin Layer
 
 ### Tools
 
-- `linear_workflow_start`
+- `linear_workflow_create_issue`
+- `linear_workflow_bind_issue`
 - `linear_workflow_update`
+- `linear_workflow_checkpoint`
 - `linear_sync_comment`
+- `linear_workflow_sync_status`
 - `linear_get_current_issue`
 - `linear_workflow_list`
 - `linear_workflow_config`
 
-### Hooks
+### Sync Model
 
-- `chat.message`: syncs user message to bound issue comment
-- `tool.execute.after`: syncs task completion to bound issue
+- Session-to-issue binding is stored in SQLite
+- Sync checkpoint metadata is stored alongside session state
+- Commands trigger explicit checkpoint evaluation after meaningful work and before review/done transitions
+- Linear comments are posted by `linear_sync_comment` after checkpoint approval
 
 ## Command Layer
 
@@ -49,7 +56,7 @@ Provided command files:
 
 - `commands/issue-start.md`
 - `commands/issue-review.md`
-- `commands/issue-close.md`
+- `commands/issue-done.md`
 - `commands/issue-cancel.md`
 
 Each command file is a markdown template with frontmatter and directs model behavior to invoke the correct plugin tool.
@@ -65,7 +72,7 @@ opencode-linear/
   commands/
     issue-start.md
     issue-review.md
-    issue-close.md
+    issue-done.md
     issue-cancel.md
   examples/linear-workflow.json
 ```
